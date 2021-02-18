@@ -91,36 +91,40 @@
 //config:	patches, but do want to waste bandwidth expaining how wrong
 //config:	it is, you will be ignored.
 //config:
-//config:	FEATURE_WGET_OPENSSL does implement TLS verification
-//config:	using the certificates available to OpenSSL.
+//config:	FEATURE_WGET_BEARSSL does implement TLS verification
+//config:	using the certificates available to BEARSSL.
 //config:
-//config:config FEATURE_WGET_OPENSSL
-//config:	bool "Try to connect to HTTPS using openssl"
+//config:config FEATURE_WGET_BEARSSL
+//config:	bool "Try to connect to HTTPS using brssl"
 //config:	default y
 //config:	depends on WGET
 //config:	help
-//config:	Try to use openssl to handle HTTPS.
+//config:	Try to use brssl to handle HTTPS.
 //config:
-//config:	OpenSSL has a simple SSL client for debug purposes.
+//config:	BearSSL has a simple SSL client for certificate verification.
 //config:	If you select this option, wget will effectively run:
-//config:	"openssl s_client -quiet -connect hostname:443
-//config:	-servername hostname 2>/dev/null" and pipe its data
-//config:	through it. -servername is not used if hostname is numeric.
+//config:	"bearssl client -q hostname:443 2>/dev/null" and pipe its data
+//config:	through it. -sni is not used if hostname is numeric.
 //config:	Note inconvenient API: host resolution is done twice,
-//config:	and there is no guarantee openssl's idea of IPv6 address
+//config:	and there is no guarantee bearssl's idea of IPv6 address
 //config:	format is the same as ours.
-//config:	Another problem is that s_client prints debug information
-//config:	to stderr, and it needs to be suppressed. This means
-//config:	all error messages get suppressed too.
-//config:	openssl is also a big binary, often dynamically linked
-//config:	against ~15 libraries.
 //config:
-//config:	If openssl can't be executed, internal TLS code will be used
-//config:	(if you enabled it); if openssl can be executed but fails later,
+//config:	If bearssl can't be executed, internal TLS code will be used
+//config:	(if you enabled it); if bearssl can be executed but fails later,
 //config:	wget can't detect this, and download will fail.
 //config:
 //config:	By default TLS verification is performed, unless
 //config:	--no-check-certificate option is passed.
+//config:
+//config:config WGET_BEARSSL_CA_CERTIFICATE
+//config:    bool "Enable passing a CA certificate file to brssl"
+//config:    default n
+//config:    depends on FEATURE_WGET_BEARSSL
+//config:
+//config:config WGET_BEARSSL_CA_CERTIFICATE_FILE
+//config:    string "Absolute path to CA certificate file to pass to brssl"
+//config:    default ""
+//config:    depends on WGET_BEARSSL_CA_CERTIFICATE
 
 //applet:IF_WGET(APPLET(wget, BB_DIR_USR_BIN, BB_SUID_DROP))
 
@@ -132,7 +136,7 @@
 /* Since we ignore these opts, we don't show them in --help */
 /* //usage:    "	[--no-cache] [--passive-ftp] [-t TRIES]" */
 /* //usage:    "	[-nv] [-nc] [-nH] [-np]" */
-//usage:       "	"IF_FEATURE_WGET_OPENSSL("[--no-check-certificate] ")"[-P DIR] [-U AGENT]"IF_FEATURE_WGET_TIMEOUT(" [-T SEC]")" URL..."
+//usage:       "	"IF_FEATURE_WGET_BEARSSL("[--no-check-certificate] ")"[-P DIR] [-U AGENT]"IF_FEATURE_WGET_TIMEOUT(" [-T SEC]")" URL..."
 //usage:	)
 //usage:	IF_NOT_FEATURE_WGET_LONG_OPTIONS(
 //usage:       "[-cqS] [-O FILE] [-o LOGFILE] [-Y on/off] [-P DIR] [-U AGENT]"IF_FEATURE_WGET_TIMEOUT(" [-T SEC]")" URL..."
@@ -141,7 +145,7 @@
 //usage:       "Retrieve files via HTTP or FTP\n"
 //usage:	IF_FEATURE_WGET_LONG_OPTIONS(
 //usage:     "\n	--spider	Only check URL existence: $? is 0 if exists"
-//usage:	IF_FEATURE_WGET_OPENSSL(
+//usage:	IF_FEATURE_WGET_BEARSSL(
 //usage:     "\n	--no-check-certificate	Don't validate the server's certificate"
 //usage:	)
 //usage:	)
@@ -172,7 +176,8 @@
 #endif
 
 
-#define SSL_SUPPORTED (ENABLE_FEATURE_WGET_OPENSSL || ENABLE_FEATURE_WGET_HTTPS)
+#define SSL_SUPPORTED (ENABLE_FEATURE_WGET_BEARSSL || ENABLE_FEATURE_WGET_HTTPS)
+#define CA_FILE CONFIG_WGET_BEARSSL_CA_CERTIFICATE_FILE
 
 struct host_info {
 	char *allocated;
@@ -391,7 +396,7 @@ static void set_alarm(void)
 # define clear_alarm() ((void)0)
 #endif
 
-#if ENABLE_FEATURE_WGET_OPENSSL
+#if ENABLE_FEATURE_WGET_BEARSSL
 /*
  * is_ip_address() attempts to verify whether or not a string
  * contains an IPv4 or IPv6 address (vs. an FQDN).  The result
@@ -648,8 +653,8 @@ static void reset_beg_range_to_zero(void)
 	/* ftruncate(G.output_fd, 0); */
 }
 
-#if ENABLE_FEATURE_WGET_OPENSSL
-static int spawn_https_helper_openssl(const char *host, unsigned port)
+#if ENABLE_FEATURE_WGET_BEARSSL
+static int spawn_https_helper_bearssl(const char *host, unsigned port)
 {
 	char *allocated = NULL;
 	char *servername;
@@ -670,49 +675,39 @@ static int spawn_https_helper_openssl(const char *host, unsigned port)
 	pid = xvfork();
 	if (pid == 0) {
 		/* Child */
-		char *argv[13];
+		char *argv[9];
 		char **argp;
 
 		close(sp[0]);
 		xmove_fd(sp[1], 0);
 		xdup2(0, 1);
 		/*
-		 * openssl s_client -quiet -connect www.kernel.org:443 2>/dev/null
+		 * brssl client -q www.kernel.org:443 2>/dev/null
 		 * It prints some debug stuff on stderr, don't know how to suppress it.
 		 * Work around by dev-nulling stderr. We lose all error messages :(
 		 */
 		xmove_fd(2, 3);
 		xopen("/dev/null", O_RDWR);
 		memset(&argv, 0, sizeof(argv));
-		argv[0] = (char*)"openssl";
-		argv[1] = (char*)"s_client";
-		argv[2] = (char*)"-quiet";
-		argv[3] = (char*)"-connect";
-		argv[4] = (char*)host;
+		argv[0] = (char*)"brssl";
+		argv[1] = (char*)"client";
+		argv[2] = (char*)"-igneof";
+		argv[3] = (char*)host;
 		/*
 		 * Per RFC 6066 Section 3, the only permitted values in the
 		 * TLS server_name (SNI) field are FQDNs (DNS hostnames).
 		 * IPv4 and IPv6 addresses, port numbers are not allowed.
 		 */
-		argp = &argv[5];
+		argp = &argv[4];
 		if (!is_ip_address(servername)) {
-			*argp++ = (char*)"-servername"; //[5]
-			*argp++ = (char*)servername;    //[6]
+			*argp++ = (char*)"-sni"; //[4]
+			*argp++ = (char*)servername; //[5]
 		}
-		if (!(option_mask32 & WGET_OPT_NO_CHECK_CERT)) {
-			/* Abort on bad server certificate */
-			*argp++ = (char*)"-verify";              //[7]
-			*argp++ = (char*)"100";                  //[8]
-			*argp++ = (char*)"-verify_return_error"; //[9]
-			if (!is_ip_address(servername)) {
-				*argp++ = (char*)"-verify_hostname"; //[10]
-				*argp++ = (char*)servername;         //[11]
-			} else {
-				*argp++ = (char*)"-verify_ip"; //[10]
-				*argp++ = (char*)host;         //[11]
-			}
-		}
-		//[12] (or earlier) is NULL terminator
+#if ENABLE_WGET_BEARSSL_CA_CERTIFICATE
+		*argp++ = (char*)"-CA";   //[6]
+		*argp++ = (char*)CA_FILE; //[7]
+#endif
+		//[8] (or earlier) is NULL terminator
 
 		BB_EXECVP(argv[0], argv);
 		xmove_fd(3, 2);
@@ -1158,22 +1153,36 @@ static void download_one_url(const char *url)
 		int status;
 
 		/* Open socket to http(s) server */
-#if ENABLE_FEATURE_WGET_OPENSSL
-		/* openssl (and maybe internal TLS) support is configured */
+#if ENABLE_FEATURE_WGET_BEARSSL
+		/* bearssl (and maybe internal TLS) support is configured */
 		if (server.protocol == P_HTTPS) {
-			/* openssl-based helper
+			int fd;
+			/* bearssl-based helper
 			 * Inconvenient API since we can't give it an open fd
 			 */
-			int fd = spawn_https_helper_openssl(server.host, server.port);
+			if (!(option_mask32 & WGET_OPT_NO_CHECK_CERT)) {
+				fd = spawn_https_helper_bearssl(server.host, server.port);
 # if ENABLE_FEATURE_WGET_HTTPS
-			if (fd < 0) { /* no openssl? try internal */
+				if (fd < 0) { /* no bearssl? try internal */
+					sfp = open_socket(lsa);
+					spawn_ssl_client(server.host, fileno(sfp), /*flags*/ 0);
+					goto socket_opened;
+				}
+			} else {
+				/* BearSSL's client is really strict (as one would expect from
+				 * an SSL client implementation from an SSL library), thus we
+				 * are using the builtin ssl_client if the user doesn't want to
+				 * verify certificates.
+				 */
 				sfp = open_socket(lsa);
 				spawn_ssl_client(server.host, fileno(sfp), /*flags*/ 0);
 				goto socket_opened;
-			}
 # else
-			/* We don't check for exec("openssl") failure in this case */
+			/* We don't check for exec("bearssl") failure in this case */
+			} else {
+				bb_simple_error_msg_and_die("builtin ssl_client must be available for this feature.");
 # endif
+			}
 			sfp = fdopen(fd, "r+");
 			if (!sfp)
 				bb_die_memory_exhausted();
